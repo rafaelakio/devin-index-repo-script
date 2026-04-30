@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git -C /c/dev/devin-index-repo-script log --oneline)",
+      "Bash(git -C /c/dev/devin-index-repo-script log --format=\"%H %s\")",
+      "Bash(git *)"
+    ]
+  }
+}

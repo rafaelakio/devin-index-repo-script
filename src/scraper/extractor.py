@@ -1,312 +1,165 @@
-"""
-Data extraction from Devin web pages.
-"""
-from typing import List, Dict, Optional
-from selenium.webdriver.common.by import By
-from selenium.webdriver.remote.webelement import WebElement
+import logging
+import time
+
+from selenium import webdriver
 from selenium.common.exceptions import NoSuchElementException, TimeoutException
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait
 
-from src.utils.logger import get_logger
+logger = logging.getLogger("devin_indexer.extractor")
 
-logger = get_logger()
+_WAIT_TIMEOUT = 15
+_REPO_CARD_SELECTOR = "a[href*='/settings/indexing/repositories/']"
+_REPO_NAME_SELECTOR = ".text-text-primary.text-13.truncate"
+_REPO_OWNER_SELECTOR = ".text-text-secondary.text-13.truncate"
 
 
-class DataExtractor:
-    """Extracts repository and branch information from Devin pages."""
-    
-    def __init__(self, driver):
-        """
-        Initialize data extractor.
-        
-        Args:
-            driver: Selenium WebDriver instance
-        """
-        self.driver = driver
-    
-    def extract_repositories(self) -> List[Dict[str, str]]:
-        """
-        Extract repository information from the indexing page.
-        
-        Returns:
-            List of dictionaries containing repository data
-        """
-        repositories = []
-        
+def wait_for_repos(driver: webdriver.Edge, timeout: int = _WAIT_TIMEOUT) -> bool:
+    try:
+        WebDriverWait(driver, timeout).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, _REPO_CARD_SELECTOR))
+        )
+        return True
+    except TimeoutException:
+        logger.warning("Repository list did not appear within timeout")
+        return False
+
+
+def extract_repo_list(driver: webdriver.Edge) -> list[dict]:
+    cards = driver.find_elements(By.CSS_SELECTOR, _REPO_CARD_SELECTOR)
+    repositories = []
+    for card in cards:
         try:
-            # Wait for repository cards to load
-            repo_links = self.driver.find_elements(
-                By.CSS_SELECTOR,
-                "a[href*='/settings/indexing/repositories/']"
-            )
-            
-            logger.info(f"Found {len(repo_links)} repository cards")
-            
-            for link in repo_links:
-                try:
-                    repo_data = self._extract_repo_from_card(link)
-                    if repo_data:
-                        repositories.append(repo_data)
-                except Exception as e:
-                    logger.warning(f"Failed to extract repository data: {str(e)}")
-                    continue
-            
-            logger.info(f"Successfully extracted {len(repositories)} repositories")
-            return repositories
-            
-        except Exception as e:
-            logger.error(f"Failed to extract repositories: {str(e)}")
-            return []
-    
-    def _extract_repo_from_card(self, card_element: WebElement) -> Optional[Dict[str, str]]:
-        """
-        Extract repository information from a single card element.
-        
-        Args:
-            card_element: WebElement representing a repository card
-            
-        Returns:
-            Dictionary with repository data or None if extraction fails
-        """
+            name = card.find_element(By.CSS_SELECTOR, _REPO_NAME_SELECTOR).text.strip()
+            owner = card.find_element(By.CSS_SELECTOR, _REPO_OWNER_SELECTOR).text.strip()
+            url = card.get_attribute("href") or ""
+            if name and url:
+                repositories.append({"name": name, "owner": owner, "url": url})
+        except NoSuchElementException as e:
+            logger.debug(f"Skipping malformed card: {e}")
+    logger.debug(f"Extracted {len(repositories)} repositories from page")
+    return repositories
+
+
+def extract_branch_list(driver: webdriver.Edge) -> list[dict]:
+    """
+    Extracts branches from a repository detail page.
+    Returns list of dicts: {name, element, indexed}
+    """
+    branches = []
+
+    # Primary: look for rows that contain branch names alongside index controls
+    try:
+        WebDriverWait(driver, _WAIT_TIMEOUT).until(
+            lambda d: len(d.find_elements(By.CSS_SELECTOR, "[data-branch], [data-testid*='branch']")) > 0
+            or len(d.find_elements(By.XPATH, "//tr[contains(@class,'branch') or contains(@data-testid,'branch')]")) > 0
+            or len(d.find_elements(By.CSS_SELECTOR, "button[aria-label*='Index'], button[aria-label*='index']")) > 0
+        )
+    except TimeoutException:
+        logger.debug("Timed out waiting for branch-specific elements, proceeding with generic extraction")
+
+    time.sleep(1)
+
+    # Strategy 1: data-branch attribute
+    branch_elements = driver.find_elements(By.CSS_SELECTOR, "[data-branch]")
+    for el in branch_elements:
+        branch_name = el.get_attribute("data-branch") or ""
+        if branch_name:
+            indexed = _is_element_indexed(el)
+            index_btn = _find_index_button_near(driver, el)
+            branches.append({"name": branch_name, "element": el, "indexed": indexed, "button": index_btn})
+
+    if branches:
+        return branches
+
+    # Strategy 2: table rows with branch text and a toggle/button
+    rows = driver.find_elements(By.CSS_SELECTOR, "tr, [role='row']")
+    for row in rows:
         try:
-            # Extract repository name
-            name_element = card_element.find_element(
-                By.CSS_SELECTOR,
-                ".text-text-primary.text-13.truncate"
-            )
-            repo_name = name_element.text.strip()
-            
-            # Extract owner
-            owner_element = card_element.find_element(
-                By.CSS_SELECTOR,
-                ".text-text-secondary.text-13.truncate"
-            )
-            owner = owner_element.text.strip()
-            
-            # Extract URL
-            repo_url = card_element.get_attribute("href")
-            
-            # Extract indexing status (optional)
-            status_text = ""
-            try:
-                status_element = card_element.find_element(
-                    By.CSS_SELECTOR,
-                    "span.text-text-secondary.text-13"
-                )
-                status_text = status_element.text.strip()
-            except NoSuchElementException:
-                pass
-            
-            repo_data = {
-                'name': repo_name,
-                'owner': owner,
-                'url': repo_url,
-                'full_name': f"{owner}/{repo_name}",
-                'status': status_text
-            }
-            
-            logger.debug(f"Extracted repository: {repo_data['full_name']}")
-            return repo_data
-            
-        except Exception as e:
-            logger.warning(f"Failed to extract data from card: {str(e)}")
-            return None
-    
-    def extract_branches(self, repo_url: str) -> List[Dict[str, str]]:
-        """
-        Extract branch information from a repository details page.
-        
-        Args:
-            repo_url: URL of the repository details page
-            
-        Returns:
-            List of dictionaries containing branch data
-        """
-        branches = []
-        
-        try:
-            # Navigate to repository details page
-            logger.debug(f"Navigating to {repo_url}")
-            self.driver.get(repo_url)
-            
-            # Wait for page to load
-            import time
-            time.sleep(2)
-            
-            # Try to find branch elements
-            # Note: The exact selectors depend on the actual page structure
-            # This is a generic implementation that may need adjustment
-            
-            branch_elements = self._find_branch_elements()
-            
-            for element in branch_elements:
-                try:
-                    branch_data = self._extract_branch_from_element(element)
-                    if branch_data:
-                        branches.append(branch_data)
-                except Exception as e:
-                    logger.warning(f"Failed to extract branch data: {str(e)}")
-                    continue
-            
-            logger.info(f"Found {len(branches)} branches")
-            return branches
-            
-        except Exception as e:
-            logger.error(f"Failed to extract branches from {repo_url}: {str(e)}")
-            return []
-    
-    def _find_branch_elements(self) -> List[WebElement]:
-        """
-        Find branch elements on the page.
-        
-        Returns:
-            List of WebElements representing branches
-        """
-        # Try multiple selectors as the structure may vary
-        selectors = [
-            "div[data-branch]",
-            "button[data-branch]",
-            "a[href*='/branch/']",
-            ".branch-item",
-            "[class*='branch']"
-        ]
-        
-        for selector in selectors:
-            try:
-                elements = self.driver.find_elements(By.CSS_SELECTOR, selector)
-                if elements:
-                    logger.debug(f"Found branch elements with selector: {selector}")
-                    return elements
-            except:
+            text = row.text.strip()
+            if not text:
                 continue
-        
-        logger.warning("Could not find branch elements with any known selector")
-        return []
-    
-    def _extract_branch_from_element(self, element: WebElement) -> Optional[Dict[str, str]]:
-        """
-        Extract branch information from an element.
-        
-        Args:
-            element: WebElement representing a branch
-            
-        Returns:
-            Dictionary with branch data or None if extraction fails
-        """
-        try:
-            # Try to get branch name from various attributes
-            branch_name = None
-            
-            # Try data attribute
-            branch_name = element.get_attribute("data-branch")
-            
-            # Try text content
-            if not branch_name:
-                branch_name = element.text.strip()
-            
-            # Try aria-label
-            if not branch_name:
-                branch_name = element.get_attribute("aria-label")
-            
-            if branch_name:
-                # Check if already indexed
-                is_indexed = self._check_if_indexed(element)
-                
-                return {
-                    'name': branch_name,
-                    'is_indexed': is_indexed
-                }
-            
-            return None
-            
+            lines = [l.strip() for l in text.splitlines() if l.strip()]
+            branch_name = lines[0] if lines else ""
+            if not branch_name or "/" in branch_name or branch_name.lower() in ("branch", "name", "status"):
+                continue
+            indexed = _is_element_indexed(row)
+            index_btn = _find_index_button_near(driver, row)
+            if index_btn or indexed:
+                branches.append({"name": branch_name, "element": row, "indexed": indexed, "button": index_btn})
         except Exception as e:
-            logger.debug(f"Failed to extract branch from element: {str(e)}")
-            return None
-    
-    def _check_if_indexed(self, element: WebElement) -> bool:
-        """
-        Check if a branch is already indexed.
-        
-        Args:
-            element: WebElement representing a branch
-            
-        Returns:
-            True if indexed, False otherwise
-        """
-        try:
-            # Look for indicators that branch is indexed
-            # This could be a checkmark icon, specific class, or text
-            
-            # Check for checkmark SVG
-            try:
-                element.find_element(By.CSS_SELECTOR, "svg[class*='check']")
-                return True
-            except NoSuchElementException:
-                pass
-            
-            # Check for "indexed" text or class
-            element_html = element.get_attribute("outerHTML").lower()
-            if "indexed" in element_html or "check" in element_html:
-                return True
-            
-            return False
-            
-        except Exception as e:
-            logger.debug(f"Failed to check index status: {str(e)}")
-            return False
-    
-    def filter_branches(
-        self,
-        branches: List[Dict[str, str]],
-        allowed_branches: List[str] = None
-    ) -> List[Dict[str, str]]:
-        """
-        Filter branches to only include specified branch names.
-        
-        Args:
-            branches: List of branch dictionaries
-            allowed_branches: List of allowed branch names (default: ['main', 'develop'])
-            
-        Returns:
-            Filtered list of branches
-        """
-        if allowed_branches is None:
-            allowed_branches = ['main', 'develop']
-        
-        # Normalize allowed branch names to lowercase
-        allowed_lower = [b.lower() for b in allowed_branches]
-        
-        filtered = [
-            branch for branch in branches
-            if branch['name'].lower() in allowed_lower
-        ]
-        
-        logger.info(f"Filtered {len(branches)} branches to {len(filtered)} (allowed: {allowed_branches})")
-        return filtered
-    
-    def get_page_title(self) -> str:
-        """
-        Get the current page title.
-        
-        Returns:
-            Page title
-        """
-        try:
-            return self.driver.title
-        except Exception as e:
-            logger.error(f"Failed to get page title: {str(e)}")
-            return ""
-    
-    def get_current_url(self) -> str:
-        """
-        Get the current page URL.
-        
-        Returns:
-            Current URL
-        """
-        try:
-            return self.driver.current_url
-        except Exception as e:
-            logger.error(f"Failed to get current URL: {str(e)}")
-            return ""
+            logger.debug(f"Row parse error: {e}")
 
-# Made with Bob
+    if branches:
+        return branches
+
+    # Strategy 3: any element with branch-like text next to an index button
+    index_buttons = driver.find_elements(
+        By.CSS_SELECTOR,
+        "button[aria-label*='Index'], button[aria-label*='index'], "
+        "button[aria-label*='Reindex'], button[aria-label*='reindex']",
+    )
+    for btn in index_buttons:
+        try:
+            parent = btn.find_element(By.XPATH, "..")
+            branch_name = _extract_branch_name_from_element(parent)
+            if branch_name:
+                branches.append({"name": branch_name, "element": parent, "indexed": False, "button": btn})
+        except Exception:
+            pass
+
+    logger.debug(f"Extracted {len(branches)} branches")
+    return branches
+
+
+def _is_element_indexed(element) -> bool:
+    try:
+        aria = (element.get_attribute("aria-checked") or "").lower()
+        if aria == "true":
+            return True
+        text = element.text.lower()
+        return "indexed" in text and "not indexed" not in text and "reindex" not in text
+    except Exception:
+        return False
+
+
+def _find_index_button_near(driver, element):
+    for selector in [
+        "button[aria-label*='Index']",
+        "button[aria-label*='index']",
+        "button[aria-label*='Reindex']",
+        "[role='switch']",
+        "input[type='checkbox']",
+    ]:
+        try:
+            btn = element.find_element(By.CSS_SELECTOR, selector)
+            return btn
+        except NoSuchElementException:
+            pass
+    return None
+
+
+def _extract_branch_name_from_element(element) -> str:
+    for selector in [
+        ".text-text-primary",
+        "span:first-child",
+        "td:first-child",
+        "[data-branch]",
+    ]:
+        try:
+            text = element.find_element(By.CSS_SELECTOR, selector).text.strip()
+            if text and len(text) < 100:
+                return text
+        except NoSuchElementException:
+            pass
+    text = element.text.strip().splitlines()
+    return text[0].strip() if text else ""
+
+
+def take_screenshot(driver: webdriver.Edge, filename: str) -> None:
+    try:
+        driver.save_screenshot(filename)
+        logger.info(f"Screenshot saved: {filename}")
+    except Exception as e:
+        logger.debug(f"Screenshot failed: {e}")

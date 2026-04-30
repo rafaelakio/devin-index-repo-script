@@ -1,0 +1,10 @@
+{
+  "indexing_url": "https://devin.ai/org/YOUR_ORG/settings/indexing",
+  "search_term": "",
+  "output_file": "./indexing_results.json",
+  "session_file": "./session.json",
+  "headless": true,
+  "max_retries": 3,
+  "rate_limit": 1.0,
+  "login_timeout": 300
+}

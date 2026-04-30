@@ -1,176 +1,86 @@
-"""
-Session and cookie management for maintaining authentication state.
-"""
 import json
+import logging
 import os
-from pathlib import Path
-from typing import Dict, List, Optional
-from datetime import datetime, timedelta
+import time
 
-from src.utils.logger import get_logger
+from selenium import webdriver
+from selenium.common.exceptions import WebDriverException
 
-logger = get_logger()
+logger = logging.getLogger("devin_indexer.session")
+
+_LOGIN_CHECK_SELECTORS = [
+    "a[href*='/settings/indexing']",
+    "nav",
+    "[data-testid='user-menu']",
+]
 
 
-class SessionHandler:
-    """Handles saving and loading browser session cookies."""
-    
-    def __init__(self, session_file: str = "session.json"):
-        """
-        Initialize session handler.
-        
-        Args:
-            session_file: Path to file for storing session cookies
-        """
-        self.session_file = Path(session_file)
-        self.cookies: List[Dict] = []
-        
-    def save_cookies(self, driver) -> None:
-        """
-        Save cookies from the current browser session.
-        
-        Args:
-            driver: Selenium WebDriver instance
-        """
+def save_session(driver: webdriver.Edge, filepath: str) -> None:
+    cookies = driver.get_cookies()
+    with open(filepath, "w", encoding="utf-8") as f:
+        json.dump(cookies, f, indent=2)
+    os.chmod(filepath, 0o600)
+    logger.info(f"Session saved to {filepath} ({len(cookies)} cookies)")
+
+
+def load_session(driver: webdriver.Edge, filepath: str, base_url: str) -> bool:
+    if not os.path.exists(filepath):
+        logger.debug("No session file found")
+        return False
+
+    try:
+        with open(filepath, encoding="utf-8") as f:
+            cookies = json.load(f)
+
+        driver.get(base_url)
+        time.sleep(1)
+
+        for cookie in cookies:
+            cookie.pop("sameSite", None)
+            try:
+                driver.add_cookie(cookie)
+            except Exception as e:
+                logger.debug(f"Skipped cookie {cookie.get('name')}: {e}")
+
+        driver.refresh()
+        time.sleep(2)
+        logger.info(f"Session loaded from {filepath}")
+        return True
+    except Exception as e:
+        logger.warning(f"Failed to load session: {e}")
+        return False
+
+
+def is_logged_in(driver: webdriver.Edge) -> bool:
+    current_url = driver.current_url
+    if "login" in current_url or "auth" in current_url or "signin" in current_url:
+        return False
+    for selector in _LOGIN_CHECK_SELECTORS:
         try:
-            self.cookies = driver.get_cookies()
-            
-            session_data = {
-                'cookies': self.cookies,
-                'saved_at': datetime.now().isoformat(),
-                'url': driver.current_url
-            }
-            
-            with open(self.session_file, 'w', encoding='utf-8') as f:
-                json.dump(session_data, f, indent=2)
-            
-            logger.info(f"Session saved to {self.session_file}")
-            logger.debug(f"Saved {len(self.cookies)} cookies")
-            
-        except Exception as e:
-            logger.error(f"Failed to save session: {str(e)}")
-            raise
-    
-    def load_cookies(self, driver) -> bool:
-        """
-        Load cookies into the browser session.
-        
-        Args:
-            driver: Selenium WebDriver instance
-            
-        Returns:
-            True if cookies were loaded successfully, False otherwise
-        """
-        if not self.session_file.exists():
-            logger.info("No saved session found")
-            return False
-        
-        try:
-            with open(self.session_file, 'r', encoding='utf-8') as f:
-                session_data = json.load(f)
-            
-            self.cookies = session_data.get('cookies', [])
-            saved_at = datetime.fromisoformat(session_data.get('saved_at', ''))
-            
-            # Check if session is too old (more than 7 days)
-            if datetime.now() - saved_at > timedelta(days=7):
-                logger.warning("Saved session is older than 7 days, may be expired")
-            
-            # Navigate to the domain first
-            saved_url = session_data.get('url', '')
-            if saved_url:
-                # Extract domain from URL
-                from urllib.parse import urlparse
-                parsed = urlparse(saved_url)
-                domain_url = f"{parsed.scheme}://{parsed.netloc}"
-                driver.get(domain_url)
-            
-            # Add cookies to the browser
-            for cookie in self.cookies:
-                try:
-                    # Remove problematic fields
-                    cookie_copy = cookie.copy()
-                    cookie_copy.pop('sameSite', None)
-                    cookie_copy.pop('expiry', None)
-                    driver.add_cookie(cookie_copy)
-                except Exception as e:
-                    logger.debug(f"Failed to add cookie {cookie.get('name')}: {str(e)}")
-            
-            logger.info(f"Loaded {len(self.cookies)} cookies from session")
+            elements = driver.find_elements("css selector", selector)
+            if elements:
+                return True
+        except WebDriverException:
+            continue
+    return False
+
+
+def wait_for_login(
+    driver: webdriver.Edge,
+    target_url: str,
+    timeout: int = 300,
+    check_interval: int = 3,
+) -> bool:
+    logger.info("Waiting for manual login... (press Ctrl+C to cancel)")
+    elapsed = 0
+    while elapsed < timeout:
+        if is_logged_in(driver):
+            logger.info("Login detected")
             return True
-            
-        except Exception as e:
-            logger.error(f"Failed to load session: {str(e)}")
-            return False
-    
-    def is_session_valid(self, driver) -> bool:
-        """
-        Check if the current session is still valid.
-        
-        Args:
-            driver: Selenium WebDriver instance
-            
-        Returns:
-            True if session is valid, False otherwise
-        """
-        try:
-            # Check if we're on a login page or have access to protected content
-            current_url = driver.current_url
-            
-            # If we're on a login page, session is invalid
-            if 'login' in current_url.lower() or 'signin' in current_url.lower():
-                logger.warning("Session appears to be invalid (on login page)")
-                return False
-            
-            # Check if we have the expected cookies
-            current_cookies = driver.get_cookies()
-            if not current_cookies:
-                logger.warning("No cookies found in current session")
-                return False
-            
-            logger.info("Session appears to be valid")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Failed to validate session: {str(e)}")
-            return False
-    
-    def clear_session(self) -> None:
-        """Delete the saved session file."""
-        try:
-            if self.session_file.exists():
-                self.session_file.unlink()
-                logger.info("Session file deleted")
-        except Exception as e:
-            logger.error(f"Failed to delete session file: {str(e)}")
-    
-    def get_session_info(self) -> Optional[Dict]:
-        """
-        Get information about the saved session.
-        
-        Returns:
-            Dictionary with session info or None if no session exists
-        """
-        if not self.session_file.exists():
-            return None
-        
-        try:
-            with open(self.session_file, 'r', encoding='utf-8') as f:
-                session_data = json.load(f)
-            
-            saved_at = datetime.fromisoformat(session_data.get('saved_at', ''))
-            age = datetime.now() - saved_at
-            
-            return {
-                'file': str(self.session_file),
-                'saved_at': session_data.get('saved_at'),
-                'age_days': age.days,
-                'url': session_data.get('url'),
-                'cookie_count': len(session_data.get('cookies', []))
-            }
-            
-        except Exception as e:
-            logger.error(f"Failed to get session info: {str(e)}")
-            return None
-
-# Made with Bob
+        time.sleep(check_interval)
+        elapsed += check_interval
+        if elapsed % 30 == 0:
+            remaining = timeout - elapsed
+            logger.info(f"Still waiting for login... ({remaining}s remaining)")
+    logger.error("Login timeout exceeded")
+    return False
