@@ -5,8 +5,10 @@ Ferramenta automatizada para descobrir, extrair e indexar repositórios de softw
 ## Pré-requisitos
 
 - Python 3.8+
-- Google Chrome / Chromium
-- ChromeDriver compatível com a versão do Chrome
+- Microsoft Edge (já disponível no Windows — não requer instalação adicional)
+
+> O script usa o **Microsoft Edge** via `webdriver-manager`, que baixa automaticamente
+> o `msedgedriver` compatível com a versão instalada na máquina.
 
 ## Instalação
 
@@ -16,17 +18,33 @@ cd devin-index-repo-script
 pip install -r requirements.txt
 ```
 
+Copie o arquivo de variáveis de ambiente:
+
+```bash
+cp .env.example .env
+# edite .env com a URL da sua organização
+```
+
 ## Como Usar
 
 ```bash
-python src/main.py [opções]
+# Primeira execução — abre o Edge para login manual
+python src/main.py --indexing-url "https://devin.ai/org/MEU_ORG/settings/indexing" --search-term "poc"
+
+# Execuções seguintes — reutiliza a sessão salva
+python src/main.py --indexing-url "https://devin.ai/org/MEU_ORG/settings/indexing" --search-term "data" --output results.json
+
+# Ver todas as opções
+python src/main.py --help
 ```
 
 O script irá:
-1. Abrir o navegador para login manual (MFA/SSO)
-2. Alternar para modo headless após autenticação
-3. Descobrir e extrair metadados dos repositórios
-4. Indexar via API da Plataforma Devin
+1. Abrir o Edge para login manual (suporte a MFA/SSO)
+2. Salvar os cookies de sessão para reutilização
+3. Alternar para modo headless após autenticação
+4. Buscar e extrair repositórios correspondentes ao termo de busca
+5. Indexar as branches `main` e `develop` de cada repositório encontrado
+6. Gerar um relatório JSON com os resultados
 
 ## Arquitetura
 
