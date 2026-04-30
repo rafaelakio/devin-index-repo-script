@@ -69,3 +69,7 @@ def cli(**kwargs):
     """Indexa repositórios do Devin usando Microsoft Edge."""
     from src.main import run
     run(**kwargs)
+
+
+if __name__ == "__main__":
+    cli()
