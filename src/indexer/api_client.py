@@ -15,6 +15,8 @@ logger = logging.getLogger("devin_indexer.indexer")
 
 _VALID_BRANCHES = {"main", "develop"}
 _ADD_BRANCH_BTN_XPATH = "//button[@role='combobox' and @aria-haspopup='dialog']"
+_INDEX_OPTIONS_BTN_XPATH = "//button[@aria-label='Index options']"
+_RELEASE_PREFIXES = ("release/", "release-", "releases/", "hotfix/", "hotfix-")
 
 
 def process_repository(
@@ -22,6 +24,7 @@ def process_repository(
     repo: dict,
     rate_limiter,
     max_retries: int = 3,
+    force_update: bool = False,
 ) -> dict:
     name = repo["name"]
     owner = repo["owner"]
@@ -42,22 +45,46 @@ def process_repository(
         time.sleep(2)
 
         indexed = extract_indexed_branches(driver)
-        result["branches_found"] = sorted(indexed)
-        logger.debug(f"Already indexed: {indexed}")
 
-        for branch_name in sorted(_VALID_BRANCHES):
+        # Read dialog once to discover available (not-yet-indexed) branches
+        available = _read_dialog_branches(driver)
+        logger.debug(f"Available to add: {available}")
+
+        # Combine both sets to find the last release branch across all known branches
+        all_known = indexed | set(available)
+        last_release = _find_last_release_branch(sorted(all_known))
+        if last_release:
+            logger.info(f"  Last release branch: {last_release}")
+
+        targets = set(_VALID_BRANCHES)
+        if last_release:
+            targets.add(last_release)
+
+        result["branches_found"] = sorted(indexed)
+
+        for branch_name in sorted(targets):
             rate_limiter.wait()
             timestamp = datetime.now(timezone.utc).isoformat()
 
             if branch_name in indexed:
-                logger.info(f"  {branch_name}: already indexed, skipping")
+                if not force_update:
+                    logger.info(f"  {branch_name}: already indexed, skipping")
+                    result["branches_processed"].append(branch_name)
+                    result["results"].append({
+                        "branch": branch_name,
+                        "status": "already_indexed",
+                        "indexed_at": timestamp,
+                    })
+                    rate_limiter.decrease()
+                    continue
+                logger.info(f"  {branch_name}: already indexed, forcing re-index")
+                branch_result = _reindex_branch(driver, repo_url, branch_name, max_retries)
                 result["branches_processed"].append(branch_name)
-                result["results"].append({
-                    "branch": branch_name,
-                    "status": "already_indexed",
-                    "indexed_at": timestamp,
-                })
-                rate_limiter.decrease()
+                result["results"].append(branch_result)
+                if branch_result["status"] == "success":
+                    rate_limiter.decrease()
+                else:
+                    rate_limiter.increase()
             else:
                 branch_result = _add_branch(driver, repo_url, branch_name, max_retries)
                 result["branches_processed"].append(branch_name)
@@ -72,6 +99,41 @@ def process_repository(
         take_screenshot(driver, f"error_{name}.png")
 
     return result
+
+
+def _read_dialog_branches(driver: webdriver.Edge) -> list[str]:
+    """Opens Add branch dialog, reads all available branch names, closes it."""
+    branches: list[str] = []
+    try:
+        add_btn = WebDriverWait(driver, 10).until(
+            EC.element_to_be_clickable((By.XPATH, _ADD_BRANCH_BTN_XPATH))
+        )
+        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", add_btn)
+        add_btn.click()
+        time.sleep(1)
+
+        for xpath in ("//*[@role='option']", "//*[@role='listitem'][not(@aria-hidden='true')]"):
+            elements = driver.find_elements(By.XPATH, xpath)
+            found = [el.text.strip() for el in elements if el.text.strip()]
+            if found:
+                branches = found
+                break
+
+    except Exception as e:
+        logger.debug(f"Could not read dialog branches: {e}")
+    finally:
+        _dismiss_dialog(driver)
+
+    return branches
+
+
+def _find_last_release_branch(branches: list[str]) -> str | None:
+    """Returns the last release/hotfix branch from a sorted list, or None."""
+    release = [
+        b for b in branches
+        if any(b.lower().startswith(p) for p in _RELEASE_PREFIXES)
+    ]
+    return release[-1] if release else None
 
 
 def _add_branch(
@@ -91,8 +153,6 @@ def _add_branch(
             time.sleep(0.3)
             add_btn.click()
             logger.debug(f"  {branch_name}: clicked 'Add branch' (attempt {attempt})")
-
-            # Wait for dialog/popover to open
             time.sleep(1)
 
             option = _find_branch_option(driver, branch_name)
@@ -136,14 +196,85 @@ def _add_branch(
     }
 
 
+def _reindex_branch(
+    driver: webdriver.Edge,
+    repo_url: str,
+    branch_name: str,
+    max_retries: int,
+) -> dict:
+    timestamp = datetime.now(timezone.utc).isoformat()
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            options_btn = WebDriverWait(driver, 10).until(
+                EC.element_to_be_clickable((By.XPATH, _INDEX_OPTIONS_BTN_XPATH))
+            )
+            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", options_btn)
+            options_btn.click()
+            time.sleep(0.8)
+
+            # Look for a menu item that relates to re-indexing, preferably for this branch
+            reindex_xpaths = [
+                f"//*[@role='menuitem' and contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'reindex') and contains(.,'{branch_name}')]",
+                f"//*[@role='menuitem' and contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'re-index') and contains(.,'{branch_name}')]",
+                f"//*[@role='menuitem' and contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'reindex')]",
+                f"//*[@role='menuitem' and contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'re-index')]",
+                f"//*[@role='menuitem' and contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'force')]",
+            ]
+
+            option = None
+            for xpath in reindex_xpaths:
+                elements = driver.find_elements(By.XPATH, xpath)
+                if elements:
+                    option = elements[0]
+                    break
+
+            if option is None:
+                logger.warning(f"  {branch_name}: no re-index option found in 'Index options' menu")
+                _dismiss_dialog(driver)
+                return {
+                    "branch": branch_name,
+                    "status": "skipped",
+                    "indexed_at": timestamp,
+                    "error": "Re-index option not found in menu",
+                }
+
+            option.click()
+            logger.info(f"  {branch_name}: re-index submitted")
+            return {
+                "branch": branch_name,
+                "status": "success",
+                "indexed_at": datetime.now(timezone.utc).isoformat(),
+            }
+
+        except StaleElementReferenceException:
+            logger.debug(f"  {branch_name}: stale element on re-index, retrying ({attempt}/{max_retries})")
+            driver.get(repo_url)
+            time.sleep(2)
+        except TimeoutException as e:
+            logger.warning(f"  {branch_name}: re-index timeout attempt {attempt}: {e}")
+            driver.get(repo_url)
+            time.sleep(2)
+        except Exception as e:
+            logger.warning(f"  {branch_name}: re-index attempt {attempt} failed: {e}")
+            driver.get(repo_url)
+            time.sleep(2)
+
+    return {
+        "branch": branch_name,
+        "status": "error",
+        "indexed_at": timestamp,
+        "error": f"Re-index failed after {max_retries} attempts",
+    }
+
+
 def _find_branch_option(driver: webdriver.Edge, branch_name: str):
     """Find the branch option inside the opened Add branch dialog."""
-    # Try typing into a search input if the dialog has one
     try:
         search_input = WebDriverWait(driver, 3).until(
             EC.presence_of_element_located((
                 By.XPATH,
-                "//*[@role='dialog' or @role='listbox' or @data-radix-popper-content-wrapper]//input"
+                "//*[@role='dialog' or @role='listbox']//input"
                 " | //input[@placeholder and not(@aria-hidden)]",
             ))
         )
@@ -154,7 +285,6 @@ def _find_branch_option(driver: webdriver.Edge, branch_name: str):
     except TimeoutException:
         logger.debug("  No search input found in dialog, proceeding without filter")
 
-    # Look for the option matching the branch name with several strategies
     option_xpaths = [
         f"//*[@role='option' and normalize-space(.)='{branch_name}']",
         f"//*[@role='option' and contains(.,'{branch_name}')]",

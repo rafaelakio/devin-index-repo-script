@@ -64,6 +64,14 @@ load_dotenv()
     type=int,
     help="Tempo máximo para login manual (segundos)",
 )
+@click.option(
+    "--force-update",
+    "force_update",
+    is_flag=True,
+    default=False,
+    envvar="FORCE_UPDATE",
+    help="Re-indexar mesmo repositórios/branches já indexados",
+)
 @click.option("--verbose", is_flag=True, default=False, help="Logs detalhados")
 def cli(**kwargs):
     """Indexa repositórios do Devin usando Microsoft Edge."""
