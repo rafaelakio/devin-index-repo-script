@@ -1,8 +1,6 @@
 import logging
 from selenium import webdriver
 from selenium.webdriver.edge.options import Options as EdgeOptions
-from selenium.webdriver.edge.service import Service as EdgeService
-from webdriver_manager.microsoft import EdgeChromiumDriverManager
 
 logger = logging.getLogger("devin_indexer.browser")
 
@@ -22,8 +20,7 @@ def _build_options(headless: bool) -> EdgeOptions:
 
 def create_driver(headless: bool = False) -> webdriver.Edge:
     options = _build_options(headless)
-    service = EdgeService(EdgeChromiumDriverManager().install())
-    driver = webdriver.Edge(service=service, options=options)
+    driver = webdriver.Edge(options=options)
     driver.implicitly_wait(10)
     mode = "headless" if headless else "visible"
     logger.debug(f"Edge driver created ({mode})")
