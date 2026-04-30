@@ -58,12 +58,10 @@ def extract_repo_list(driver: webdriver.Edge) -> list[dict]:
 
 
 def _card_has_indexed_branches(card) -> bool:
-    """Checks if the repo card shows 'N branch indexed' indicator."""
+    """Checks if the repo card shows 'N branch indexed' indicator (not 'Not indexed.')."""
     try:
-        # The indicator is a span sibling or ancestor neighbour of the <a> card
-        container = card.find_element(By.XPATH, "..")
-        indicators = container.find_elements(
-            By.XPATH, ".//*[contains(., 'branch indexed')]"
+        indicators = card.find_elements(
+            By.XPATH, ".//*[contains(., 'branch indexed') and not(contains(., 'Not indexed'))]"
         )
         return bool(indicators)
     except Exception:
