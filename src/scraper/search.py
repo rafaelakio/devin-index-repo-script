@@ -2,7 +2,7 @@ import logging
 import time
 
 from selenium import webdriver
-from selenium.common.exceptions import TimeoutException
+from selenium.common.exceptions import StaleElementReferenceException, TimeoutException
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
@@ -50,14 +50,18 @@ def _load_all_repositories(driver: webdriver.Edge, rate_limit: float) -> None:
         if not buttons:
             break
 
-        btn = buttons[0]
         try:
+            btn = buttons[0]
             driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
             time.sleep(0.3)
             btn.click()
             page += 1
             logger.debug(f"Clicked 'Load more' (page {page})")
             time.sleep(max(rate_limit, 1.5))
+        except StaleElementReferenceException:
+            logger.debug("'Load more' button went stale, re-finding")
+            time.sleep(0.5)
+            continue
         except Exception as e:
             logger.debug(f"'Load more' click failed, stopping pagination: {e}")
             break
