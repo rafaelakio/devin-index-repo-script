@@ -33,9 +33,6 @@ ENV/
 *.swo
 *~
 
-# Environment variables
-.env
-
 # Session and output files
 session.json
 *.log
@@ -55,3 +52,20 @@ htmlcov/
 # Screenshots (for debugging)
 screenshots/
 *.png
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Secrets
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Terraform
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
