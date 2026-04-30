@@ -42,12 +42,32 @@ def extract_repo_list(driver: webdriver.Edge) -> list[dict]:
             name = card.find_element(By.CSS_SELECTOR, _REPO_NAME_SELECTOR).text.strip()
             owner = card.find_element(By.CSS_SELECTOR, _REPO_OWNER_SELECTOR).text.strip()
             url = card.get_attribute("href") or ""
-            if name and url:
-                repositories.append({"name": name, "owner": owner, "url": url})
+            if not name or not url:
+                continue
+            has_indexed = _card_has_indexed_branches(card)
+            repositories.append({
+                "name": name,
+                "owner": owner,
+                "url": url,
+                "has_indexed_branches": has_indexed,
+            })
         except NoSuchElementException as e:
             logger.debug(f"Skipping malformed card: {e}")
     logger.debug(f"Extracted {len(repositories)} repositories from page")
     return repositories
+
+
+def _card_has_indexed_branches(card) -> bool:
+    """Checks if the repo card shows 'N branch indexed' indicator."""
+    try:
+        # The indicator is a span sibling or ancestor neighbour of the <a> card
+        container = card.find_element(By.XPATH, "..")
+        indicators = container.find_elements(
+            By.XPATH, ".//*[contains(., 'branch indexed')]"
+        )
+        return bool(indicators)
+    except Exception:
+        return False
 
 
 def extract_indexed_branches(driver: webdriver.Edge) -> set[str]:

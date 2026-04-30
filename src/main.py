@@ -26,6 +26,7 @@ def run(
     max_retries: int,
     rate_limit: float,
     login_timeout: int,
+    force_update: bool,
     verbose: bool,
 ) -> None:
     logger = setup_logger(verbose)
@@ -97,8 +98,11 @@ def run(
 
         # --- Process each repository ---
         for repo in repositories:
+            if not force_update and repo.get("has_indexed_branches"):
+                logger.info(f"Skipping {repo['owner']}/{repo['name']} (already indexed, use --force-update to override)")
+                continue
             rate_limiter.wait()
-            repo_result = process_repository(driver, repo, rate_limiter, max_retries)
+            repo_result = process_repository(driver, repo, rate_limiter, max_retries, force_update)
             writer.add_repository(RepositoryResult(
                 name=repo_result["name"],
                 owner=repo_result["owner"],
