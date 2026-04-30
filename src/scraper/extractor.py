@@ -14,6 +14,14 @@ _REPO_CARD_SELECTOR = "a[href*='/settings/indexing/repositories/']"
 _REPO_NAME_SELECTOR = ".text-text-primary.text-13.truncate"
 _REPO_OWNER_SELECTOR = ".text-text-secondary.text-13.truncate"
 
+# Branch list on repository detail page
+_ADD_BRANCH_BTN_XPATH = "//button[@role='combobox' and @aria-haspopup='dialog']"
+_INDEXED_BRANCH_XPATH = (
+    "//div[contains(@class,'flex') and contains(@class,'items-center')"
+    " and .//svg[contains(@class,'text-text-green')]]"
+    "//span[contains(@class,'text-text-primary') and contains(@class,'mr-auto')]"
+)
+
 
 def wait_for_repos(driver: webdriver.Edge, timeout: int = _WAIT_TIMEOUT) -> bool:
     try:
@@ -42,119 +50,27 @@ def extract_repo_list(driver: webdriver.Edge) -> list[dict]:
     return repositories
 
 
-def extract_branch_list(driver: webdriver.Edge) -> list[dict]:
-    """
-    Extracts branches from a repository detail page.
-    Returns list of dicts: {name, element, indexed}
-    """
-    branches = []
-
-    # Primary: look for rows that contain branch names alongside index controls
+def extract_indexed_branches(driver: webdriver.Edge) -> set[str]:
+    """Returns names of branches that already have the green checkmark (indexed)."""
+    indexed: set[str] = set()
     try:
         WebDriverWait(driver, _WAIT_TIMEOUT).until(
-            lambda d: len(d.find_elements(By.CSS_SELECTOR, "[data-branch], [data-testid*='branch']")) > 0
-            or len(d.find_elements(By.XPATH, "//tr[contains(@class,'branch') or contains(@data-testid,'branch')]")) > 0
-            or len(d.find_elements(By.CSS_SELECTOR, "button[aria-label*='Index'], button[aria-label*='index']")) > 0
+            EC.presence_of_element_located((By.XPATH, _ADD_BRANCH_BTN_XPATH))
         )
     except TimeoutException:
-        logger.debug("Timed out waiting for branch-specific elements, proceeding with generic extraction")
+        logger.warning("Branch section did not appear within timeout")
+        return indexed
 
     time.sleep(1)
 
-    # Strategy 1: data-branch attribute
-    branch_elements = driver.find_elements(By.CSS_SELECTOR, "[data-branch]")
-    for el in branch_elements:
-        branch_name = el.get_attribute("data-branch") or ""
-        if branch_name:
-            indexed = _is_element_indexed(el)
-            index_btn = _find_index_button_near(driver, el)
-            branches.append({"name": branch_name, "element": el, "indexed": indexed, "button": index_btn})
+    spans = driver.find_elements(By.XPATH, _INDEXED_BRANCH_XPATH)
+    for span in spans:
+        name = span.text.strip()
+        if name:
+            indexed.add(name)
 
-    if branches:
-        return branches
-
-    # Strategy 2: table rows with branch text and a toggle/button
-    rows = driver.find_elements(By.CSS_SELECTOR, "tr, [role='row']")
-    for row in rows:
-        try:
-            text = row.text.strip()
-            if not text:
-                continue
-            lines = [l.strip() for l in text.splitlines() if l.strip()]
-            branch_name = lines[0] if lines else ""
-            if not branch_name or "/" in branch_name or branch_name.lower() in ("branch", "name", "status"):
-                continue
-            indexed = _is_element_indexed(row)
-            index_btn = _find_index_button_near(driver, row)
-            if index_btn or indexed:
-                branches.append({"name": branch_name, "element": row, "indexed": indexed, "button": index_btn})
-        except Exception as e:
-            logger.debug(f"Row parse error: {e}")
-
-    if branches:
-        return branches
-
-    # Strategy 3: any element with branch-like text next to an index button
-    index_buttons = driver.find_elements(
-        By.CSS_SELECTOR,
-        "button[aria-label*='Index'], button[aria-label*='index'], "
-        "button[aria-label*='Reindex'], button[aria-label*='reindex']",
-    )
-    for btn in index_buttons:
-        try:
-            parent = btn.find_element(By.XPATH, "..")
-            branch_name = _extract_branch_name_from_element(parent)
-            if branch_name:
-                branches.append({"name": branch_name, "element": parent, "indexed": False, "button": btn})
-        except Exception:
-            pass
-
-    logger.debug(f"Extracted {len(branches)} branches")
-    return branches
-
-
-def _is_element_indexed(element) -> bool:
-    try:
-        aria = (element.get_attribute("aria-checked") or "").lower()
-        if aria == "true":
-            return True
-        text = element.text.lower()
-        return "indexed" in text and "not indexed" not in text and "reindex" not in text
-    except Exception:
-        return False
-
-
-def _find_index_button_near(driver, element):
-    for selector in [
-        "button[aria-label*='Index']",
-        "button[aria-label*='index']",
-        "button[aria-label*='Reindex']",
-        "[role='switch']",
-        "input[type='checkbox']",
-    ]:
-        try:
-            btn = element.find_element(By.CSS_SELECTOR, selector)
-            return btn
-        except NoSuchElementException:
-            pass
-    return None
-
-
-def _extract_branch_name_from_element(element) -> str:
-    for selector in [
-        ".text-text-primary",
-        "span:first-child",
-        "td:first-child",
-        "[data-branch]",
-    ]:
-        try:
-            text = element.find_element(By.CSS_SELECTOR, selector).text.strip()
-            if text and len(text) < 100:
-                return text
-        except NoSuchElementException:
-            pass
-    text = element.text.strip().splitlines()
-    return text[0].strip() if text else ""
+    logger.debug(f"Indexed branches: {indexed}")
+    return indexed
 
 
 def take_screenshot(driver: webdriver.Edge, filename: str) -> None:

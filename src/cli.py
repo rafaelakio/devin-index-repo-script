@@ -37,7 +37,7 @@ load_dotenv()
 @click.option(
     "--headless/--no-headless",
     envvar="HEADLESS_MODE",
-    default=True,
+    default=False,
     show_default=True,
     help="Usar modo headless após autenticação",
 )
