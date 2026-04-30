@@ -3,22 +3,18 @@ import time
 from datetime import datetime, timezone
 
 from selenium import webdriver
-from selenium.common.exceptions import (
-    ElementClickInterceptedException,
-    ElementNotInteractableException,
-    StaleElementReferenceException,
-    TimeoutException,
-)
+from selenium.common.exceptions import StaleElementReferenceException, TimeoutException
 from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
-from src.scraper.extractor import extract_branch_list, take_screenshot
+from src.scraper.extractor import extract_indexed_branches, take_screenshot
 
 logger = logging.getLogger("devin_indexer.indexer")
 
 _VALID_BRANCHES = {"main", "develop"}
-_INDEXING_CONFIRMATION_TIMEOUT = 20
+_ADD_BRANCH_BTN_XPATH = "//button[@role='combobox' and @aria-haspopup='dialog']"
 
 
 def process_repository(
@@ -45,25 +41,31 @@ def process_repository(
         driver.get(repo_url)
         time.sleep(2)
 
-        branches = extract_branch_list(driver)
-        all_branch_names = [b["name"] for b in branches]
-        result["branches_found"] = all_branch_names
-        logger.debug(f"Branches found: {all_branch_names}")
+        indexed = extract_indexed_branches(driver)
+        result["branches_found"] = sorted(indexed)
+        logger.debug(f"Already indexed: {indexed}")
 
-        valid = [b for b in branches if b["name"].lower() in _VALID_BRANCHES]
-        if not valid:
-            logger.info(f"No main/develop branches found for {owner}/{name}, skipping")
-            return result
-
-        for branch in valid:
+        for branch_name in sorted(_VALID_BRANCHES):
             rate_limiter.wait()
-            branch_result = _index_branch(driver, name, branch, max_retries)
-            result["branches_processed"].append(branch["name"])
-            result["results"].append(branch_result)
-            if branch_result["status"] == "success":
+            timestamp = datetime.now(timezone.utc).isoformat()
+
+            if branch_name in indexed:
+                logger.info(f"  {branch_name}: already indexed, skipping")
+                result["branches_processed"].append(branch_name)
+                result["results"].append({
+                    "branch": branch_name,
+                    "status": "already_indexed",
+                    "indexed_at": timestamp,
+                })
                 rate_limiter.decrease()
             else:
-                rate_limiter.increase()
+                branch_result = _add_branch(driver, repo_url, branch_name, max_retries)
+                result["branches_processed"].append(branch_name)
+                result["results"].append(branch_result)
+                if branch_result["status"] == "success":
+                    rate_limiter.decrease()
+                else:
+                    rate_limiter.increase()
 
     except Exception as e:
         logger.error(f"Failed to process {owner}/{name}: {e}")
@@ -72,45 +74,58 @@ def process_repository(
     return result
 
 
-def _index_branch(
+def _add_branch(
     driver: webdriver.Edge,
-    repo_name: str,
-    branch: dict,
+    repo_url: str,
+    branch_name: str,
     max_retries: int,
 ) -> dict:
-    branch_name = branch["name"]
     timestamp = datetime.now(timezone.utc).isoformat()
-
-    if branch.get("indexed"):
-        logger.info(f"  {branch_name}: already indexed, skipping")
-        return {"branch": branch_name, "status": "already_indexed", "indexed_at": timestamp}
-
-    button = branch.get("button")
-    if button is None:
-        logger.warning(f"  {branch_name}: no index control found")
-        return {
-            "branch": branch_name,
-            "status": "error",
-            "indexed_at": timestamp,
-            "error": "Index control not found",
-        }
 
     for attempt in range(1, max_retries + 1):
         try:
-            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", button)
-            time.sleep(0.5)
-            button.click()
-            _wait_for_indexing_confirmation(driver, branch_name)
-            logger.info(f"  {branch_name}: indexed successfully")
-            return {"branch": branch_name, "status": "success", "indexed_at": datetime.now(timezone.utc).isoformat()}
+            add_btn = WebDriverWait(driver, 10).until(
+                EC.element_to_be_clickable((By.XPATH, _ADD_BRANCH_BTN_XPATH))
+            )
+            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", add_btn)
+            time.sleep(0.3)
+            add_btn.click()
+            logger.debug(f"  {branch_name}: clicked 'Add branch' (attempt {attempt})")
+
+            # Wait for dialog/popover to open
+            time.sleep(1)
+
+            option = _find_branch_option(driver, branch_name)
+
+            if option is None:
+                logger.info(f"  {branch_name}: not available in dialog (branch may not exist in repo)")
+                _dismiss_dialog(driver)
+                return {
+                    "branch": branch_name,
+                    "status": "not_found",
+                    "indexed_at": timestamp,
+                    "error": "Branch not available in selection dialog",
+                }
+
+            option.click()
+            logger.info(f"  {branch_name}: submitted")
+            return {
+                "branch": branch_name,
+                "status": "success",
+                "indexed_at": datetime.now(timezone.utc).isoformat(),
+            }
+
         except StaleElementReferenceException:
             logger.debug(f"  {branch_name}: stale element, retrying ({attempt}/{max_retries})")
+            driver.get(repo_url)
             time.sleep(2)
-        except (ElementClickInterceptedException, ElementNotInteractableException) as e:
-            logger.warning(f"  {branch_name}: click failed attempt {attempt}: {e}")
+        except TimeoutException as e:
+            logger.warning(f"  {branch_name}: timeout on attempt {attempt}: {e}")
+            driver.get(repo_url)
             time.sleep(2)
-        except TimeoutException:
-            logger.warning(f"  {branch_name}: confirmation timeout attempt {attempt}/{max_retries}")
+        except Exception as e:
+            logger.warning(f"  {branch_name}: attempt {attempt} failed: {e}")
+            driver.get(repo_url)
             time.sleep(2)
 
     return {
@@ -121,30 +136,49 @@ def _index_branch(
     }
 
 
-def _wait_for_indexing_confirmation(driver: webdriver.Edge, branch_name: str) -> None:
+def _find_branch_option(driver: webdriver.Edge, branch_name: str):
+    """Find the branch option inside the opened Add branch dialog."""
+    # Try typing into a search input if the dialog has one
     try:
-        WebDriverWait(driver, _INDEXING_CONFIRMATION_TIMEOUT).until(
-            lambda d: _detect_indexing_feedback(d, branch_name)
+        search_input = WebDriverWait(driver, 3).until(
+            EC.presence_of_element_located((
+                By.XPATH,
+                "//*[@role='dialog' or @role='listbox' or @data-radix-popper-content-wrapper]//input"
+                " | //input[@placeholder and not(@aria-hidden)]",
+            ))
         )
+        search_input.clear()
+        search_input.send_keys(branch_name)
+        time.sleep(0.8)
+        logger.debug(f"  Typed '{branch_name}' in dialog search input")
     except TimeoutException:
-        # Not all UIs show explicit confirmation; treat as success if no error appeared
-        error_indicators = driver.find_elements(By.CSS_SELECTOR, "[role='alert'], .error, [data-error]")
-        if error_indicators:
-            raise TimeoutException(f"Error indicator detected after clicking index for {branch_name}")
-        logger.debug(f"No explicit confirmation for {branch_name}, assuming success")
+        logger.debug("  No search input found in dialog, proceeding without filter")
 
-
-def _detect_indexing_feedback(driver: webdriver.Edge, branch_name: str) -> bool:
-    feedback_selectors = [
-        "[role='status']",
-        "[aria-live]",
-        ".toast",
-        "[data-testid*='success']",
-        "[data-testid*='indexed']",
+    # Look for the option matching the branch name with several strategies
+    option_xpaths = [
+        f"//*[@role='option' and normalize-space(.)='{branch_name}']",
+        f"//*[@role='option' and contains(.,'{branch_name}')]",
+        f"//*[@role='listitem' and normalize-space(.)='{branch_name}']",
+        f"//li[normalize-space(.)='{branch_name}']",
+        f"//*[@role='menuitem' and normalize-space(.)='{branch_name}']",
+        f"//*[normalize-space(.)='{branch_name}' and (ancestor::*[@role='dialog'] or ancestor::*[@role='listbox'])]",
     ]
-    for selector in feedback_selectors:
-        elements = driver.find_elements(By.CSS_SELECTOR, selector)
-        for el in elements:
-            if el.text and ("index" in el.text.lower() or "success" in el.text.lower()):
-                return True
-    return False
+
+    for xpath in option_xpaths:
+        try:
+            elements = driver.find_elements(By.XPATH, xpath)
+            if elements:
+                logger.debug(f"  Found branch option via: {xpath}")
+                return elements[0]
+        except Exception:
+            pass
+
+    return None
+
+
+def _dismiss_dialog(driver: webdriver.Edge) -> None:
+    try:
+        driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
+        time.sleep(0.5)
+    except Exception:
+        pass

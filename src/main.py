@@ -61,6 +61,12 @@ def run(
         if headless:
             logger.info("Switching to headless mode")
             cookies = driver.get_cookies()
+            local_storage = driver.execute_script(
+                "return Object.entries(localStorage);"
+            ) or []
+            session_storage = driver.execute_script(
+                "return Object.entries(sessionStorage);"
+            ) or []
             quit_driver(driver)
             driver = create_driver(headless=True)
             driver.get(base_url)
@@ -70,6 +76,15 @@ def run(
                     driver.add_cookie(cookie)
                 except Exception:
                     pass
+            driver.get(base_url)
+            for key, value in local_storage:
+                driver.execute_script(
+                    "localStorage.setItem(arguments[0], arguments[1]);", key, value
+                )
+            for key, value in session_storage:
+                driver.execute_script(
+                    "sessionStorage.setItem(arguments[0], arguments[1]);", key, value
+                )
             driver.get(indexing_url)
             time.sleep(2)
 
