@@ -35,37 +35,34 @@ def wait_for_repos(driver: webdriver.Edge, timeout: int = _WAIT_TIMEOUT) -> bool
 
 
 def extract_repo_list(driver: webdriver.Edge) -> list[dict]:
-    cards = driver.find_elements(By.CSS_SELECTOR, _REPO_CARD_SELECTOR)
+    card_data = driver.execute_script("""
+        const sel = "a[href*='/settings/indexing/repositories/']";
+        const nameSel = ".text-text-primary.text-13.truncate";
+        const ownerSel = ".text-text-secondary.text-13.truncate";
+        return Array.from(document.querySelectorAll(sel)).map(card => {
+            const nameEl  = card.querySelector(nameSel);
+            const ownerEl = card.querySelector(ownerSel);
+            const text    = card.innerText || "";
+            return {
+                href:        card.href,
+                name:        nameEl  ? nameEl.innerText.trim()  : "",
+                owner:       ownerEl ? ownerEl.innerText.trim() : "",
+                has_indexed: text.includes("branch indexed") && !text.includes("Not indexed")
+            };
+        });
+    """) or []
+
     repositories = []
-    for card in cards:
-        try:
-            name = card.find_element(By.CSS_SELECTOR, _REPO_NAME_SELECTOR).text.strip()
-            owner = card.find_element(By.CSS_SELECTOR, _REPO_OWNER_SELECTOR).text.strip()
-            url = card.get_attribute("href") or ""
-            if not name or not url:
-                continue
-            has_indexed = _card_has_indexed_branches(card)
+    for data in card_data:
+        if data.get("name") and data.get("href"):
             repositories.append({
-                "name": name,
-                "owner": owner,
-                "url": url,
-                "has_indexed_branches": has_indexed,
+                "name":                 data["name"],
+                "owner":                data["owner"],
+                "url":                  data["href"],
+                "has_indexed_branches": data["has_indexed"],
             })
-        except NoSuchElementException as e:
-            logger.debug(f"Skipping malformed card: {e}")
     logger.debug(f"Extracted {len(repositories)} repositories from page")
     return repositories
-
-
-def _card_has_indexed_branches(card) -> bool:
-    """Checks if the repo card shows 'N branch indexed' indicator (not 'Not indexed.')."""
-    try:
-        indicators = card.find_elements(
-            By.XPATH, ".//*[contains(., 'branch indexed') and not(contains(., 'Not indexed'))]"
-        )
-        return bool(indicators)
-    except Exception:
-        return False
 
 
 def extract_indexed_branches(driver: webdriver.Edge) -> set[str]:
