@@ -13,8 +13,21 @@ from src.indexer.api_client import process_repository
 from src.indexer.retry_handler import AdaptiveRateLimiter
 from src.scraper.extractor import take_screenshot
 from src.scraper.search import navigate_to_indexing, search_repositories
+from src.utils.control_file import ControlFile
 from src.utils.logger import setup_logger
-from src.utils.output import OutputWriter, RepositoryResult, ErrorEntry
+from src.utils.output import OutputWriter, RepositoryResult
+
+_DEAD_SESSION_KEYWORDS = (
+    "httpconnectionpool",
+    "read timed out",
+    "no such driver session",
+    "invalid session id",
+    "connection refused",
+    "connection reset",
+    "newconnectionerror",
+    "remotedisconnected",
+    "connectionabortederror",
+)
 
 
 def run(
@@ -22,6 +35,7 @@ def run(
     search_term: str,
     output_file: str,
     session_file: str,
+    control_file: str,
     headless: bool,
     max_retries: int,
     rate_limit: float,
@@ -89,27 +103,66 @@ def run(
             driver.get(indexing_url)
             time.sleep(2)
 
-        # --- Search and extract repositories ---
-        repositories = search_repositories(driver, indexing_url, search_term, rate_limit)
-
-        if not repositories:
-            logger.warning("No repositories found. Check search term and page structure.")
-            take_screenshot(driver, "no_repos_found.png")
+        # --- Load or create control file ---
+        ctrl = ControlFile(control_file)
+        if ctrl.exists() and ctrl.load() and ctrl.matches(indexing_url, search_term):
+            logger.info(f"Resuming previous run — {ctrl.pending_count()} repos still pending")
+        else:
+            repositories = search_repositories(driver, indexing_url, search_term, rate_limit)
+            if not repositories:
+                logger.warning("No repositories found. Check search term and page structure.")
+                take_screenshot(driver, "no_repos_found.png")
+            ctrl.initialize(indexing_url, search_term, repositories)
 
         # --- Process each repository ---
-        for repo in repositories:
-            if not force_update and repo.get("has_indexed_branches"):
-                logger.info(f"Skipping {repo['owner']}/{repo['name']} (already indexed, use --force-update to override)")
+        for idx, repo_ctrl in enumerate(ctrl.get_repositories()):
+            if repo_ctrl["status"] in ("done", "skipped"):
                 continue
+
+            if not force_update and repo_ctrl.get("has_indexed_branches"):
+                logger.info(
+                    f"Skipping {repo_ctrl['owner']}/{repo_ctrl['name']} "
+                    "(already indexed, use --force-update to override)"
+                )
+                ctrl.mark_skipped(idx, "already indexed")
+                continue
+
+            ctrl.mark_processing(idx)
             rate_limiter.wait()
-            repo_result = process_repository(driver, repo, rate_limiter, max_retries, force_update)
+
+            repo_result = _process_with_recovery(
+                driver=driver,
+                repo=repo_ctrl,
+                rate_limiter=rate_limiter,
+                max_retries=max_retries,
+                force_update=force_update,
+                headless=headless,
+                base_url=base_url,
+                session_file=session_file,
+                indexing_url=indexing_url,
+                logger=logger,
+            )
+
+            if repo_result is None:
+                ctrl.mark_error(idx, "session recovery exhausted")
+                # driver may have been replaced inside — retrieve it
+                continue
+
+            # repo_result is a (driver, result_dict) tuple after recovery
+            driver, result_dict = repo_result
+
+            if result_dict.get("_session_dead"):
+                ctrl.mark_error(idx, "session could not be recovered")
+                continue
+
+            ctrl.mark_done(idx, result_dict)
             writer.add_repository(RepositoryResult(
-                name=repo_result["name"],
-                owner=repo_result["owner"],
-                url=repo_result["url"],
-                branches_found=repo_result["branches_found"],
-                branches_processed=repo_result["branches_processed"],
-                results=repo_result["results"],
+                name=result_dict["name"],
+                owner=result_dict["owner"],
+                url=result_dict["url"],
+                branches_found=result_dict["branches_found"],
+                branches_processed=result_dict["branches_processed"],
+                results=result_dict["results"],
             ))
 
     except KeyboardInterrupt:
@@ -134,6 +187,68 @@ def run(
         f"Failed: {meta['failed_indexations']} | "
         f"Already indexed: {meta['already_indexed']}"
     )
+
+
+def _process_with_recovery(
+    driver,
+    repo: dict,
+    rate_limiter,
+    max_retries: int,
+    force_update: bool,
+    headless: bool,
+    base_url: str,
+    session_file: str,
+    indexing_url: str,
+    logger,
+):
+    """Run process_repository with up to 2 session-recovery attempts on WebDriver death."""
+    for attempt in range(3):
+        try:
+            result = process_repository(driver, repo, rate_limiter, max_retries, force_update)
+            return driver, result
+        except Exception as e:
+            if _is_session_dead(e) and attempt < 2:
+                logger.warning(
+                    f"WebDriver session died ({e.__class__.__name__}: {e}), "
+                    f"recreating session (attempt {attempt + 1}/2)..."
+                )
+                driver = _recreate_session(driver, headless, base_url, session_file, indexing_url, logger)
+                time.sleep(2)
+            else:
+                logger.error(f"Failed to process {repo['owner']}/{repo['name']}: {e}")
+                return driver, {"_session_dead": True, **_empty_result(repo)}
+
+    return driver, {"_session_dead": True, **_empty_result(repo)}
+
+
+def _recreate_session(old_driver, headless: bool, base_url: str, session_file: str, indexing_url: str, logger) -> object:
+    quit_driver(old_driver)
+    time.sleep(3)
+    driver = create_driver(headless=headless)
+    if load_session(driver, session_file, indexing_url):
+        if is_logged_in(driver):
+            logger.info("Session recreated successfully")
+        else:
+            logger.warning("Session file loaded but user is not authenticated")
+    else:
+        logger.warning("Could not reload session file after recovery")
+    return driver
+
+
+def _is_session_dead(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return any(kw in msg for kw in _DEAD_SESSION_KEYWORDS)
+
+
+def _empty_result(repo: dict) -> dict:
+    return {
+        "name": repo["name"],
+        "owner": repo["owner"],
+        "url": repo["url"],
+        "branches_found": [],
+        "branches_processed": [],
+        "results": [],
+    }
 
 
 def _extract_base_url(url: str) -> str:

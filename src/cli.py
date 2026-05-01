@@ -35,6 +35,13 @@ load_dotenv()
     help="Arquivo para persistir cookies de sessão",
 )
 @click.option(
+    "--control-file",
+    envvar="CONTROL_FILE_PATH",
+    default="./indexing_control.json",
+    show_default=True,
+    help="Arquivo de controle para rastreamento e retomada de execução",
+)
+@click.option(
     "--headless/--no-headless",
     envvar="HEADLESS_MODE",
     default=False,
