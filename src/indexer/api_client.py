@@ -1,4 +1,5 @@
 import logging
+import re
 import time
 from datetime import datetime, timezone
 
@@ -50,15 +51,20 @@ def process_repository(
         available = _read_dialog_branches(driver)
         logger.debug(f"Available to add: {available}")
 
-        # Combine both sets to find the last release branch across all known branches
+        # Combine both sets to know all branches present in this repo
         all_known = indexed | set(available)
-        last_release = _find_last_release_branch(sorted(all_known))
-        if last_release:
-            logger.info(f"  Last release branch: {last_release}")
 
-        targets = set(_VALID_BRANCHES)
-        if last_release:
-            targets.add(last_release)
+        # Priority: use main/develop; only fall back to last release if neither exists
+        primary_in_repo = all_known & _VALID_BRANCHES
+        if primary_in_repo:
+            targets = set(_VALID_BRANCHES)
+        else:
+            last_release = _find_last_release_branch(list(all_known))
+            if last_release:
+                logger.info(f"  main/develop not found; falling back to last release: {last_release}")
+                targets = {last_release}
+            else:
+                targets = set(_VALID_BRANCHES)
 
         result["branches_found"] = sorted(indexed)
 
@@ -127,13 +133,25 @@ def _read_dialog_branches(driver: webdriver.Edge) -> list[str]:
     return branches
 
 
+def _version_key(branch: str) -> tuple:
+    for p in _RELEASE_PREFIXES:
+        if branch.lower().startswith(p):
+            suffix = branch[len(p):]
+            break
+    else:
+        suffix = branch
+    suffix = suffix.lstrip("vV")
+    parts = re.split(r"[^0-9]+", suffix)
+    return tuple(int(p) for p in parts if p.isdigit())
+
+
 def _find_last_release_branch(branches: list[str]) -> str | None:
-    """Returns the last release/hotfix branch from a sorted list, or None."""
+    """Returns the highest-versioned release/hotfix branch, using numeric version comparison."""
     release = [
         b for b in branches
         if any(b.lower().startswith(p) for p in _RELEASE_PREFIXES)
     ]
-    return release[-1] if release else None
+    return max(release, key=_version_key) if release else None
 
 
 def _add_branch(
