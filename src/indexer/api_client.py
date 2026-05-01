@@ -4,7 +4,11 @@ import time
 from datetime import datetime, timezone
 
 from selenium import webdriver
-from selenium.common.exceptions import StaleElementReferenceException, TimeoutException
+from selenium.common.exceptions import (
+    ElementNotInteractableException,
+    StaleElementReferenceException,
+    TimeoutException,
+)
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support import expected_conditions as EC
@@ -185,7 +189,13 @@ def _add_branch(
                     "error": "Branch not available in selection dialog",
                 }
 
-            option.click()
+            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", option)
+            time.sleep(0.3)
+            try:
+                option.click()
+            except ElementNotInteractableException:
+                logger.debug(f"  {branch_name}: element not interactable, using JS click")
+                driver.execute_script("arguments[0].click();", option)
             logger.info(f"  {branch_name}: submitted")
             return {
                 "branch": branch_name,
